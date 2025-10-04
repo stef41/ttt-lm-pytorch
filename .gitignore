@@ -1,3 +1,75 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+
+# PyTorch / HF caches (local project outputs)
+wandb/
+wandb_*/
+outputs/
+test_output/
+test_perplexity_output/
+test_sliding_window_output/
+comparison_outputs/
+gpu_test_outputs/
+wandb_gpu_test/
+wandb_test/
+wandb_test_enabled/
+
+# Model artifacts we generate in this repo
+no_bias_state_test/
+no_bias_test/
+no_state_passing_model/
+state_passing_model/
+properly_trained_model/
+stable_trained_model/
+well_trained_model/
+conservative_ttt_model/
+
+# Curriculum training experiments
+curriculum_exp/
+curriculum_exp_w128/
+curriculum_w128_training.log
+
+# Overfitting study experiments
+overfitting_w64/
+overfitting_w128/
+overfitting_w64_training.log
+overfitting_w128_training.log
+overfitting_study_master.log
+overfitting_*_crash.log
+
+# Tuner/eval runs
+tuning_runs/
+
+# Local trash can used by scripts/cleanup.py
+.trash/
+
+# Logs
+*.log
+
+# Generated plots and analysis
+*.png
+!README_assets/*.png
+W128_vs_W64_comprehensive_analysis.png
+overfitting_analysis.png
+length_generalization_*.png
+
+# Model weights and checkpoints
+*.pt
+*.pth
+*.bin
+*.ckpt
+*.safetensors
+*.h5
+*.onnx
+*.pb
+model.safetensors
+pytorch_model.bin
+model_*.bin
+checkpoint-*/
+**/final_model/
+**/best_model/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

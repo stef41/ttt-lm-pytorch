@@ -29,28 +29,36 @@ logger = logging.get_logger(__name__)
 
 TTT_STANDARD_CONFIGS = {
     "125m": {
+        "vocab_size": 50257,  # Match GPT-2 tokenizer
         "hidden_size": 768,
         "intermediate_size": 2048,
         "num_hidden_layers": 12,
         "num_attention_heads": 12,
+        "pre_conv": False,
     },
     "350m": {
+        "vocab_size": 50257,  # Match GPT-2 tokenizer
         "hidden_size": 1024,
         "intermediate_size": 2736,
         "num_hidden_layers": 24,
         "num_attention_heads": 16,
+        "pre_conv": False,
     },
     "760m": {
+        "vocab_size": 50257,  # Match GPT-2 tokenizer
         "hidden_size": 1536,
         "intermediate_size": 4096,
         "num_hidden_layers": 24,
         "num_attention_heads": 16,
+        "pre_conv": False,
     },
     "1b": {
+        "vocab_size": 50257,  # Match GPT-2 tokenizer
         "hidden_size": 2048,
         "intermediate_size": 5504,
         "num_hidden_layers": 24,
         "num_attention_heads": 32,
+        "pre_conv": False,
     },
 }
 
@@ -126,6 +134,7 @@ class TTTConfig(PretrainedConfig):
         ttt_base_lr (`float`, *optional*, defaults to 1.0): base learning rate for TTT learner
         pre_conv (`bool`, *optional*, defaults to `False`): whether use conv before TTT
         conv_kernel (`int`, *optional*, defaults to 4): kernel size of the conv layer
+        state_passing (`bool`, *optional*, defaults to `True`): whether to pass TTT internal states between batches during training for continuous learning
         scan_checkpoint_group_size (`int`, *optional*, defaults to 0):
             gradient checkpoint group size on seq dimension, 0 means no checkpointing.
             In JAX implementation, we set it 4, which means we group 4 mini-batches together in 1 gradient checkpointg to save memory.
@@ -171,6 +180,8 @@ class TTTConfig(PretrainedConfig):
         mini_batch_size=16,
         pre_conv=False,
         conv_kernel=4,
+        disable_conv=True,
+        state_passing=True,
         scan_checkpoint_group_size=0,
         **kwargs,
     ):
@@ -196,6 +207,8 @@ class TTTConfig(PretrainedConfig):
 
         self.pre_conv = pre_conv
         self.conv_kernel = conv_kernel
+        self.disable_conv = disable_conv
+        self.state_passing = state_passing
         self.scan_checkpoint_group_size = scan_checkpoint_group_size
 
         super().__init__(
@@ -373,6 +386,10 @@ class Conv(nn.Module):
         )
 
     def __call__(self, hidden_states, cache_params=None):
+        # If convolutions are disabled, return input unchanged
+        if self.config.disable_conv:
+            return hidden_states
+            
         seq_len = hidden_states.shape[1]
         hidden_states = self.norm(hidden_states)
         # [B, C, L]
@@ -535,9 +552,9 @@ class TTTCache:
 
         self.ttt_params_dict = defaultdict(dict)
         if "linear" in config.ttt_layer_type:
-            self.ttt_param_names = ["W1", "b1"]
+            self.ttt_param_names = ["W1"]  # Removed b1
         elif "mlp" in config.ttt_layer_type:
-            self.ttt_param_names = ["W1", "b1", "W2", "b2"]
+            self.ttt_param_names = ["W1", "W2"]  # Removed b1, b2
         else:
             raise ValueError(f"TTT Layer Type {config.ttt_layer_type} not supported yet")
 
@@ -558,7 +575,8 @@ class TTTCache:
                     config.conv_kernel,
                     device=model.device,
                 )
-            if config.share_qk:
+            # Only create conv cache if convolutions are not disabled
+            if config.share_qk and not config.disable_conv:
                 self.conv_states_dic["ttt_conv_q"][layer_idx] = torch.zeros(
                     batch_size,
                     config.hidden_size,
@@ -573,10 +591,13 @@ class TTTCache:
                 )
 
     def update(self, py_tree, layer_idx, seq_len):
+        # Detach tensors to avoid gradient computation issues during cache updates
+        # This prevents "backward through graph" errors while maintaining state passing
         if seq_len % self.mini_batch_size == 0:
             # copy last mini-batch states, clear gradients
             for name in self.ttt_param_names:
-                self.ttt_params_dict[f"{name}_states"][layer_idx].copy_(py_tree[f"{name}_states"])
+                # Use detach() and clone() to avoid in-place operations on gradient-tracked tensors
+                self.ttt_params_dict[f"{name}_states"][layer_idx] = py_tree[f"{name}_states"].detach().clone()
                 self.ttt_params_dict[f"{name}_grad"][layer_idx].zero_()
         elif seq_len < self.mini_batch_size:
             if seq_len != 1 and self.seqlen_offset > 0 and self.seqlen_offset % self.mini_batch_size != 0:
@@ -584,12 +605,14 @@ class TTTCache:
             if (seq_len + self.seqlen_offset) % self.mini_batch_size == 0:
                 # copy last mini-batch states, clear gradients
                 for name in self.ttt_param_names:
-                    self.ttt_params_dict[f"{name}_states"][layer_idx].copy_(py_tree[f"{name}_states"])
+                    # Use detach() and clone() to avoid in-place operations on gradient-tracked tensors
+                    self.ttt_params_dict[f"{name}_states"][layer_idx] = py_tree[f"{name}_states"].detach().clone()
                     self.ttt_params_dict[f"{name}_grad"][layer_idx].zero_()
             else:
                 # copy gradients for the next update
                 for name in self.ttt_param_names:
-                    self.ttt_params_dict[f"{name}_grad"][layer_idx].copy_(py_tree[f"{name}_grad"])
+                    # Use detach() and clone() to avoid in-place operations on gradient-tracked tensors
+                    self.ttt_params_dict[f"{name}_grad"][layer_idx] = py_tree[f"{name}_grad"].detach().clone()
         else:
             raise ValueError(f"seq_len {seq_len} is a partial update not supported yet")
 
@@ -645,7 +668,8 @@ class TTTBase(nn.Module):
         self.o_proj = nn.Linear(self.width, self.num_heads * self.head_dim, bias=False)
 
         # after share Q/K projection, we use different conv layers for Q and K
-        if self.share_qk:
+        # Only create conv layers if convolutions are not disabled
+        if self.share_qk and not self.config.disable_conv:
             self.conv_q = nn.Conv1d(
                 self.hidden_size,
                 self.hidden_size,
@@ -701,6 +725,12 @@ class TTTBase(nn.Module):
     def get_qkv_projections(self, hidden_states, cache_params: Optional[TTTCache] = None):
         if self.share_qk:
             xq, XV = self.q_proj(hidden_states), self.v_proj(hidden_states)
+            
+            # If convolutions are disabled, return projections directly without conv
+            if self.config.disable_conv:
+                XQ, XK = xq, xq  # Both Q and K are the same when sharing projection
+                return XQ, XK, XV
+            
             seq_len = xq.shape[1]
             xq = xq.transpose(1, 2)
             if causal_conv1d_fn is None:
@@ -920,7 +950,6 @@ class TTTLinear(TTTBase):
         super().__init__(config, layer_idx)
         # TTT model initialization for TTT-Linear
         self.W1 = nn.Parameter(torch.normal(0, 0.02, size=(self.num_heads, self.head_dim, self.head_dim)))
-        self.b1 = nn.Parameter(torch.zeros(self.num_heads, 1, self.head_dim))
 
     def ttt(
         self,
@@ -952,8 +981,6 @@ class TTTLinear(TTTBase):
         def compute_mini_batch(params_dict, inputs):
             # [B, nh, f, f], nh=num_heads, f=head_dim
             W1_init = params_dict["W1_states"]
-            # [B, nh, 1, f]
-            b1_init = params_dict["b1_states"]
 
             # [B,nh,K,f], K=mini_batch_size
             XQ_mini_batch = inputs["XQ"]
@@ -965,8 +992,8 @@ class TTTLinear(TTTBase):
             ttt_lr_eta_mini_batch = inputs["ttt_lr_eta"]
 
             X1 = XK_mini_batch
-            # [B,nh,K,f] @ [B,nh,f,f] -> [B,nh,K,f]
-            Z1 = X1 @ W1_init + b1_init
+            # [B,nh,K,f] @ [B,nh,f,f] -> [B,nh,K,f] (no bias)
+            Z1 = X1 @ W1_init
             reconstruction_target = XV_mini_batch - XK_mini_batch
 
             ln_weight = self.ttt_norm_weight.reshape(self.num_heads, 1, self.head_dim)
@@ -977,18 +1004,13 @@ class TTTLinear(TTTBase):
             if use_dual_form:
                 # [B,nh,K,K]
                 Attn1 = torch.tril(XQ_mini_batch @ X1.transpose(-2, -1))
-                # [B,nh,1,f] - [B,nh,K,K] @ [B,nh,K,f] -> [B,nh,K,f]
-                b1_bar = b1_init - torch.tril(eta_mini_batch) @ grad_l_wrt_Z1
-                # [B,nh,K,f] @ [B,nh,f,f] - ([B,nh,K,1] * [B,nh,K,K]) @ [B,nh,K,f] + [B,nh,K,f]
-                Z1_bar = XQ_mini_batch @ W1_init - (eta_mini_batch * Attn1) @ grad_l_wrt_Z1 + b1_bar
+                # [B,nh,K,f] @ [B,nh,f,f] - ([B,nh,K,1] * [B,nh,K,K]) @ [B,nh,K,f] (no bias)
+                Z1_bar = XQ_mini_batch @ W1_init - (eta_mini_batch * Attn1) @ grad_l_wrt_Z1
 
                 last_eta_mini_batch = eta_mini_batch[:, :, -1, :, None]
                 # [B,nh,f,f] - [B,nh,f,K] @ [B,nh,K,f]
                 W1_last = W1_init - (last_eta_mini_batch * X1).transpose(-1, -2) @ grad_l_wrt_Z1
-                # [B,nh,1,f]
-                b1_last = b1_init - torch.sum(last_eta_mini_batch * grad_l_wrt_Z1, dim=-2, keepdim=True)
                 grad_W1_last = torch.zeros_like(W1_last)
-                grad_b1_last = torch.zeros_like(b1_last)
             else:
                 ttt_lr_eta_mini_batch = torch.broadcast_to(
                     ttt_lr_eta_mini_batch,
@@ -1003,20 +1025,14 @@ class TTTLinear(TTTBase):
                 grad_W1 = torch.einsum("bhki,bhkj->bhkij", X1, grad_l_wrt_Z1)
                 grad_W1 = torch.einsum("bhnk,bhkij->bhnij", torch.tril(ttt_lr_eta_mini_batch), grad_W1)
                 grad_W1 = grad_W1 + params_dict["W1_grad"].unsqueeze(2)
-                # [B, nh, K, f]
-                grad_b1 = torch.einsum("bhnk,bhki->bhni", torch.tril(ttt_lr_eta_mini_batch), grad_l_wrt_Z1)
-                grad_b1 = grad_b1 + params_dict["b1_grad"]
 
                 W1_bar = W1_init.unsqueeze(2) - grad_W1 * token_eta_mini_batch.unsqueeze(-1)
-                b1_bar = b1_init - grad_b1 * token_eta_mini_batch
 
-                # [B, nh, K, 1, f] @ [B, nh, K, f, f]
-                Z1_bar = (XQ_mini_batch.unsqueeze(3) @ W1_bar).squeeze(3) + b1_bar
+                # [B, nh, K, 1, f] @ [B, nh, K, f, f] (no bias)
+                Z1_bar = (XQ_mini_batch.unsqueeze(3) @ W1_bar).squeeze(3)
 
                 W1_last = W1_bar[:, :, -1]
-                b1_last = b1_bar[:, :, -1:]
                 grad_W1_last = grad_W1[:, :, -1]
-                grad_b1_last = grad_b1[:, :, -1:]
 
             Z1_bar = ln_fwd(Z1_bar, ln_weight, ln_bias)
 
@@ -1024,9 +1040,7 @@ class TTTLinear(TTTBase):
 
             last_param_dict = {
                 "W1_states": W1_last,
-                "b1_states": b1_last,
                 "W1_grad": grad_W1_last,
-                "b1_grad": grad_b1_last,
             }
             return last_param_dict, XQW_mini_batch
 
@@ -1035,10 +1049,8 @@ class TTTLinear(TTTBase):
         else:
             init_params_dict = {
                 "W1_states": torch.tile(self.W1.unsqueeze(0), dims=(B, 1, 1, 1)),
-                "b1_states": torch.tile(self.b1.unsqueeze(0), dims=(B, 1, 1, 1)),
             }
             init_params_dict.update(W1_grad=torch.zeros_like(init_params_dict["W1_states"]))
-            init_params_dict.update(b1_grad=torch.zeros_like(init_params_dict["b1_states"]))
 
         # [B,num_heads, num_mini_batch, mini_batch_size, f] -> [num_mini_batch, B, num_heads, mini_batch_size, f]
         inputs = tree_map(lambda x: x.permute(2, 0, 1, 3, 4), inputs)
@@ -1074,9 +1086,7 @@ class TTTMLP(TTTBase):
         super().__init__(config, layer_idx)
         # TTT model initialization for TTT-MLP
         self.W1 = nn.Parameter(torch.normal(0, 0.02, size=(self.num_heads, self.head_dim, 4 * self.head_dim)))
-        self.b1 = nn.Parameter(torch.zeros(self.num_heads, 1, 4 * self.head_dim))
         self.W2 = nn.Parameter(torch.normal(0, 0.02, size=(self.num_heads, 4 * self.head_dim, self.head_dim)))
-        self.b2 = nn.Parameter(torch.zeros(self.num_heads, 1, self.head_dim))
 
     def ttt(
         self,
@@ -1107,12 +1117,8 @@ class TTTMLP(TTTBase):
         def compute_mini_batch(params_dict, inputs):
             # [B, nh, f, 4f]
             W1_init = params_dict["W1_states"]
-            # [B, nh, 1, 4f]
-            b1_init = params_dict["b1_states"]
             # [B, nh, 4f, f]
             W2_init = params_dict["W2_states"]
-            # [B, nh, 1, f]
-            b2_init = params_dict["b2_states"]
 
             # [B,nh,K,f]
             XQ_mini_batch = inputs["XQ"]
@@ -1124,11 +1130,11 @@ class TTTMLP(TTTBase):
             ttt_lr_eta_mini_batch = inputs["ttt_lr_eta"]
 
             X1 = XK_mini_batch
-            # [B,nh,K,f] @ [B,nh,f,4f] -> [B,nh,K,4f]
-            Z1 = X1 @ W1_init + b1_init
+            # [B,nh,K,f] @ [B,nh,f,4f] -> [B,nh,K,4f] (no bias)
+            Z1 = X1 @ W1_init
             X2 = F.gelu(Z1, approximate="tanh")
-            # [B,nh,K,4f] @ [B,nh,4f,f] -> [B,nh,K,f]
-            Z2 = X2 @ W2_init + b2_init
+            # [B,nh,K,4f] @ [B,nh,4f,f] -> [B,nh,K,f] (no bias)
+            Z2 = X2 @ W2_init
             reconstruction_target = XV_mini_batch - XK_mini_batch
 
             ln_weight = self.ttt_norm_weight.reshape(self.num_heads, 1, self.head_dim)
@@ -1140,32 +1146,22 @@ class TTTMLP(TTTBase):
 
             if use_dual_form:
                 Attn1 = torch.tril(XQ_mini_batch @ X1.transpose(-2, -1))  # [B,nh,K,K]
-                # [B,nh,1,f] - [B,nh,K,K] @ [B,nh,K,4f] -> [B,nh,K,4f]
-                b1_bar = b1_init - torch.tril(eta_mini_batch) @ grad_l_wrt_Z1
-                # [B,nh,K,f] @ [B,nh,f,4f] - ([B,nh,K,1] * [B,nh,K,K]) @ [B,nh,K,4f] + [B,nh,K,4f]
-                Z1_bar = XQ_mini_batch @ W1_init - (eta_mini_batch * Attn1) @ grad_l_wrt_Z1 + b1_bar
+                # [B,nh,K,f] @ [B,nh,f,4f] - ([B,nh,K,1] * [B,nh,K,K]) @ [B,nh,K,4f] (no bias)
+                Z1_bar = XQ_mini_batch @ W1_init - (eta_mini_batch * Attn1) @ grad_l_wrt_Z1
                 X2_bar = F.gelu(Z1_bar, approximate="tanh")
 
                 # [B,nh,K,K]
                 Attn2 = torch.tril(X2_bar @ X2.transpose(-2, -1))
-                # [B,nh,1,f] - [B,nh,K,1] * [B,nh,K,f] -> [B,nh,K,f]
-                b2_bar = b2_init - torch.tril(eta_mini_batch) @ grad_l_wrt_Z2
-                # [B,nh,K,f] @ [1,nh,4f,f] - ([B,nh,K,1] * [B,nh,K,K]) @ [B,nh,K,f] + [B,nh,K,f]
-                Z2_bar = X2_bar @ W2_init - (eta_mini_batch * Attn2) @ grad_l_wrt_Z2 + b2_bar
+                # [B,nh,K,f] @ [1,nh,4f,f] - ([B,nh,K,1] * [B,nh,K,K]) @ [B,nh,K,f] (no bias)
+                Z2_bar = X2_bar @ W2_init - (eta_mini_batch * Attn2) @ grad_l_wrt_Z2
 
                 last_eta_mini_batch = eta_mini_batch[:, :, -1, :, None]
                 # [B,nh,f,4f] - [B,nh,f,K] @ [B,nh,K,4f]
                 W1_last = W1_init - (last_eta_mini_batch * X1).transpose(-1, -2) @ grad_l_wrt_Z1
-                # [B,nh,1,4f]
-                b1_last = b1_init - torch.sum(last_eta_mini_batch * grad_l_wrt_Z1, dim=-2, keepdim=True)
                 # [B,nh,4f,f] - [B,nh,4f,K] @ [B,nh,K,f]
                 W2_last = W2_init - (last_eta_mini_batch * X2).transpose(-1, -2) @ grad_l_wrt_Z2
-                # [B,nh,1,f]
-                b2_last = b2_init - torch.sum(last_eta_mini_batch * grad_l_wrt_Z2, dim=-2, keepdim=True)
                 grad_W1_last = torch.zeros_like(W1_last)
-                grad_b1_last = torch.zeros_like(b1_last)
                 grad_W2_last = torch.zeros_like(W2_last)
-                grad_b2_last = torch.zeros_like(b2_last)
 
             else:
                 ttt_lr_eta_mini_batch = torch.broadcast_to(
@@ -1181,36 +1177,24 @@ class TTTMLP(TTTBase):
                 grad_W2 = torch.einsum("bhki,bhkj->bhkij", X2, grad_l_wrt_Z2)
                 grad_W2 = torch.einsum("bhnk,bhkij->bhnij", torch.tril(ttt_lr_eta_mini_batch), grad_W2)
                 grad_W2 = grad_W2 + params_dict["W2_grad"].unsqueeze(2)
-                # [B, nh, K, f]
-                grad_b2 = torch.einsum("bhnk,bhki->bhni", torch.tril(ttt_lr_eta_mini_batch), grad_l_wrt_Z2)
-                grad_b2 = grad_b2 + params_dict["b2_grad"]
 
                 # [B, nh, K, f, 4f]
                 grad_W1 = torch.einsum("bhki,bhkj->bhkij", X1, grad_l_wrt_Z1)
                 grad_W1 = torch.einsum("bhnk,bhkij->bhnij", torch.tril(ttt_lr_eta_mini_batch), grad_W1)
                 grad_W1 = grad_W1 + params_dict["W1_grad"].unsqueeze(2)
-                # [B, nh, K, 4f]
-                grad_b1 = torch.einsum("bhnk,bhki->bhni", torch.tril(ttt_lr_eta_mini_batch), grad_l_wrt_Z1)
-                grad_b1 = grad_b1 + params_dict["b1_grad"]
 
                 W1_bar = W1_init.unsqueeze(2) - grad_W1 * token_eta_mini_batch.unsqueeze(-1)
-                b1_bar = b1_init - grad_b1 * token_eta_mini_batch
                 W2_bar = W2_init.unsqueeze(2) - grad_W2 * token_eta_mini_batch.unsqueeze(-1)
-                b2_bar = b2_init - grad_b2 * token_eta_mini_batch
 
-                # [B, nh, K, 1, f] @ [B, nh, K, f, 4f] -> [B, nh, K, 4f]
-                Z1_bar = (XQ_mini_batch.unsqueeze(3) @ W1_bar).squeeze(3) + b1_bar
+                # [B, nh, K, 1, f] @ [B, nh, K, f, 4f] -> [B, nh, K, 4f] (no bias)
+                Z1_bar = (XQ_mini_batch.unsqueeze(3) @ W1_bar).squeeze(3)
                 X2_bar = F.gelu(Z1_bar, approximate="tanh")
-                Z2_bar = (X2_bar.unsqueeze(3) @ W2_bar).squeeze(3) + b2_bar
+                Z2_bar = (X2_bar.unsqueeze(3) @ W2_bar).squeeze(3)
 
                 W1_last = W1_bar[:, :, -1]
-                b1_last = b1_bar[:, :, -1:]
                 W2_last = W2_bar[:, :, -1]
-                b2_last = b2_bar[:, :, -1:]
                 grad_W1_last = grad_W1[:, :, -1]
-                grad_b1_last = grad_b1[:, :, -1:]
                 grad_W2_last = grad_W2[:, :, -1]
-                grad_b2_last = grad_b2[:, :, -1:]
 
             Z2_bar = ln_fwd(Z2_bar, ln_weight, ln_bias)
 
@@ -1218,13 +1202,9 @@ class TTTMLP(TTTBase):
 
             last_param_dict = {
                 "W1_states": W1_last,
-                "b1_states": b1_last,
                 "W2_states": W2_last,
-                "b2_states": b2_last,
                 "W1_grad": grad_W1_last,
-                "b1_grad": grad_b1_last,
                 "W2_grad": grad_W2_last,
-                "b2_grad": grad_b2_last,
             }
             return last_param_dict, XQW_mini_batch
 
@@ -1233,14 +1213,10 @@ class TTTMLP(TTTBase):
         else:
             init_params_dict = {
                 "W1_states": torch.tile(self.W1.unsqueeze(0), dims=(B, 1, 1, 1)),
-                "b1_states": torch.tile(self.b1.unsqueeze(0), dims=(B, 1, 1, 1)),
                 "W2_states": torch.tile(self.W2.unsqueeze(0), dims=(B, 1, 1, 1)),
-                "b2_states": torch.tile(self.b2.unsqueeze(0), dims=(B, 1, 1, 1)),
             }
             init_params_dict.update(W1_grad=torch.zeros_like(init_params_dict["W1_states"]))
-            init_params_dict.update(b1_grad=torch.zeros_like(init_params_dict["b1_states"]))
             init_params_dict.update(W2_grad=torch.zeros_like(init_params_dict["W2_states"]))
-            init_params_dict.update(b2_grad=torch.zeros_like(init_params_dict["b2_states"]))
         inputs = tree_map(lambda x: x.permute(2, 0, 1, 3, 4), inputs)  # [B,nh,NC,CS,f] -> [NC,B,nh,CS,f]
         # allocate output tensor
         XQW_batch = torch.empty(
