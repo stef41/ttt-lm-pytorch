@@ -1,0 +1,16 @@
+{
+  "window_size": 32,
+  "total_steps": 100000,
+  "save_every": 200,
+  "batch_size": 4,
+  "grad_accum_steps": 4,
+  "lr": 0.0003,
+  "gpu": 5,
+  "d_model": 768,
+  "n_layers": 12,
+  "n_heads": 12,
+  "mini_batch_size": 16,
+  "ttt_lr": 1.0,
+  "output_dir": "length_gen_w32_with_ckpts",
+  "wandb_project": null
+}

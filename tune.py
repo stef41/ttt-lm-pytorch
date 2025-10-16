@@ -79,8 +79,8 @@ class TrialConfig:
     mixed_precision: str = "bf16"  # "no" | "fp16" | "bf16"
     state_passing: bool = True
     state_reset_interval: int = 100
-    dataset_name: str = "wikitext"
-    dataset_config: str = "wikitext-2-raw-v1"
+    dataset_name: str = "allenai/c4"
+    dataset_config: str = "en"
     dataset_subset_size: int = -1
     seed: int = 42
 
@@ -274,8 +274,8 @@ def main():
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--max-train-steps", type=int, default=50)
     parser.add_argument("--dataset-subset-size", type=int, default=5000)
-    parser.add_argument("--dataset-name", type=str, default="wikitext")
-    parser.add_argument("--dataset-config", type=str, default="wikitext-2-raw-v1")
+    parser.add_argument("--dataset-name", type=str, default="allenai/c4")
+    parser.add_argument("--dataset-config", type=str, default="en")
     parser.add_argument("--eval-factor", type=int, default=10)
     parser.add_argument("--eval-max-seqs", type=int, default=16)
     parser.add_argument("--eval-batch-size", type=int, default=4)
